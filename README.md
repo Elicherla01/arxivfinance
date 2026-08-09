@@ -53,25 +53,60 @@ home page is served from the ISR cache in well under a second.
 ### Data
 
 Papers come from the arXiv Atom API (`export.arxiv.org/api/query`), the supported
-machine-readable view of the archive listing pages. `lib/arxiv.ts` queries each subject
-class with `cat:<id>`, sorted by submission date, plus one bulk `cat:q-fin*` query that
-backs the **Latest** tab.
+machine-readable view of the archive listing pages.
+
+A snapshot is **two requests**, not one per subject class: a bulk `cat:q-fin*` query and
+a second pass for `econ.GN`. Papers are then bucketed into the nine subject classes
+locally. This matters — arXiv asks for a single connection and roughly one request every
+three seconds, and an earlier version that fanned out across all nine classes in parallel
+earned a string of `429`s that blocked the IP for several minutes.
 
 Two details worth knowing:
 
 - `q-fin.EC` is an alias for `econ.GN`. Papers are only ever tagged with the econ code,
-  so querying `cat:q-fin.EC` returns nothing — the client queries `econ.GN` instead.
+  so `cat:q-fin*` never returns them and they need their own query.
 - Papers are frequently cross-listed, so the same paper legitimately appears under
   several subject classes.
 
-Requests go out in batches of three to stay polite with arXiv, and responses are cached
-for 30 minutes on the server. The **Refresh** button bypasses that cache.
+Responses are cached for 30 minutes on the server. The **Refresh** button bypasses that
+cache.
 
-Every request is bounded by a 12-second timeout with one retry, and the whole snapshot
-has a 40-second budget. arXiv throttles cloud IPs and will sometimes accept a connection
-and then never answer, so without those bounds a single stalled request hangs forever.
-Once the budget is spent, remaining subject classes are skipped and the page renders
-with what arrived, marked "Skipped: arXiv was too slow to answer in time".
+### Time windows
+
+The window selector controls how far back a snapshot reaches, using arXiv's
+`submittedDate` filter:
+
+| Window | Range | Papers pulled |
+| --- | --- | --- |
+| Recent | newest, no date filter | ~250 |
+| 1 month | 30 days | ~450 |
+| 6 months | 182 days | ~650 |
+| 1 year | 365 days | ~850 |
+
+q-fin gets roughly 3,400 submissions a year, which is far more than is useful to ship to
+a browser, so wide windows load the newest slice and the UI states plainly how many of
+the window's papers were loaded. Wider windows take longer and weigh more — the 1-year
+snapshot is about 1&nbsp;MB gzipped.
+
+### Timeouts
+
+arXiv's latency swings between 100&nbsp;ms and well over a minute depending on how it
+feels about your IP, so every layer is bounded: each request has a timeout with one
+backed-off retry, the snapshot has an overall budget, and the route caps the whole thing
+at 50 seconds. The request timeout is enforced by racing a timer rather than trusting
+`AbortSignal` alone, because an aborted request under Next's cached `fetch` has been seen
+to keep running — a 45-second budget once produced a 101-second response.
+
+### Search
+
+Search queries **arXiv itself**, not the loaded window, so it reaches the entire q-fin
+archive including papers that were never on screen. `/api/search` builds an `all:` query
+— which covers titles, abstracts, authors and comments — scoped to
+`(cat:q-fin* OR cat:econ.GN)` and to the selected time window, and returns the top 100
+by relevance. Searching *deep hedging* on the Recent window matches papers back to 2011.
+
+User input is reduced to plain terms before the query is assembled, so field prefixes,
+quotes and boolean operators cannot change what is asked.
 
 ## Deploying
 
@@ -109,11 +144,14 @@ The same data is available as JSON:
 | Route | Result |
 | --- | --- |
 | `GET /api/papers` | Full snapshot: every subject class plus the latest stream |
+| `GET /api/papers?range=1y` | Widen the window: `recent`, `1m`, `6m`, `1y` |
 | `GET /api/papers?category=q-fin.TR` | One subject class |
-| `GET /api/papers?limit=20` | Papers per class (default 12) |
+| `GET /api/papers?limit=20` | Papers for a single class |
 | `GET /api/papers?refresh=1` | Bypass the 30-minute cache |
+| `GET /api/search?q=deep+hedging` | Search the whole archive, ranked by relevance |
+| `GET /api/search?q=jump+risk&range=6m` | Same, restricted to a window |
 
-This route is what the UI itself calls. Responses are cached for 30 minutes, so repeat
+These routes are what the UI itself calls. Responses are cached for 30 minutes, so repeat
 calls return in milliseconds instead of re-querying arXiv.
 
 ## Layout
@@ -121,24 +159,26 @@ calls return in milliseconds instead of re-querying arXiv.
 ```
 app/
   page.tsx            static shell; no data fetching
-  api/papers/route.ts JSON API, the only place that talks to arXiv
+  api/papers/route.ts snapshot API
+  api/search/route.ts archive-wide search
 components/
-  archive-explorer.tsx  fetches papers, stats, tabs, search and sort (client)
+  archive-explorer.tsx  fetches papers, stats, tabs, window and search (client)
   paper-card.tsx        summary card with expandable abstract
-  relative-time.tsx     client-rendered "2d ago" labels
+  relative-time.tsx     "2d ago" labels
   ui/                   shadcn/ui components
 lib/
   arxiv.ts            API client and Atom parser (server only)
   summarize.ts        extractive summarizer
   categories.ts       the nine q-fin subject classes
-  config.ts           constants shared by server and client
+  config.ts           window definitions shared by server and client
 ```
 
-`lib/arxiv.ts` is imported as a value only by the API route; components import from it
+`lib/arxiv.ts` is imported as a value only by the API routes; components import from it
 with `import type`, so none of the arXiv client reaches the browser bundle.
 
-Relative timestamps render as absolute dates first and swap to "2d ago" after mount, so
-a cached page does not hydrate with a stale "now".
+Summaries are built in the browser, in `PaperCard`, rather than sent from the server.
+They are derived from the abstract, so shipping both would send the same prose twice —
+about 38% of the payload — and only cards actually on screen pay for the work.
 
 ## Credit
 

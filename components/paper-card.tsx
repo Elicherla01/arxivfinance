@@ -17,11 +17,19 @@ import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import { Separator } from "@/components/ui/separator";
 import { CATEGORY_MAP, categoryAccent } from "@/lib/categories";
 import type { Paper } from "@/lib/arxiv";
+import { summarizeAbstract } from "@/lib/summarize";
 import { cn, formatAuthors, formatDate } from "@/lib/utils";
 
 export function PaperCard({ paper, index = 0 }: { paper: Paper; index?: number }) {
   const [open, setOpen] = React.useState(false);
   const accent = categoryAccent(paper.qfinCategories[0] ?? paper.primaryCategory);
+
+  // Summaries are derived from the abstract, so sending them from the server
+  // would ship the same prose twice. Only rendered cards pay for this.
+  const summary = React.useMemo(
+    () => summarizeAbstract(paper.abstract, paper.title),
+    [paper.abstract, paper.title],
+  );
 
   return (
     <Card
@@ -70,13 +78,13 @@ export function PaperCard({ paper, index = 0 }: { paper: Paper; index?: number }
             Summary
           </p>
           <p className="text-sm leading-relaxed text-foreground/90">
-            {paper.summary.tldr}
+            {summary.tldr}
           </p>
         </div>
 
-        {paper.summary.highlights.length > 0 && (
+        {summary.highlights.length > 0 && (
           <ul className="space-y-1.5">
-            {paper.summary.highlights.map((line, i) => (
+            {summary.highlights.map((line, i) => (
               <li key={i} className="flex gap-2 text-sm text-muted-foreground">
                 <span
                   className="mt-1.5 size-1.5 shrink-0 rounded-full"
@@ -88,9 +96,9 @@ export function PaperCard({ paper, index = 0 }: { paper: Paper; index?: number }
           </ul>
         )}
 
-        {paper.summary.topics.length > 0 && (
+        {summary.topics.length > 0 && (
           <div className="flex flex-wrap gap-1.5">
-            {paper.summary.topics.map((topic) => (
+            {summary.topics.map((topic) => (
               <Badge key={topic} variant="secondary" className="font-normal">
                 {topic}
               </Badge>
@@ -105,7 +113,7 @@ export function PaperCard({ paper, index = 0 }: { paper: Paper; index?: number }
           <span aria-hidden>·</span>
           <span>{formatDate(paper.published)}</span>
           <span aria-hidden>·</span>
-          <span>{paper.summary.readingMinutes} min abstract</span>
+          <span>{summary.readingMinutes} min abstract</span>
 
           <div className="ml-auto flex items-center gap-1">
             <Button

@@ -7,17 +7,37 @@
  */
 
 import { CATEGORIES, type CategoryId } from "./categories";
-import { REVALIDATE_SECONDS } from "./config";
-import { summarizeAbstract, type PaperSummary } from "./summarize";
-
+import {
+  DEFAULT_RANGE,
+  RANGES,
+  REVALIDATE_SECONDS,
+  type RangeConfig,
+  type RangeKey,
+} from "./config";
 export { REVALIDATE_SECONDS };
 
 const API_BASE = "https://export.arxiv.org/api/query";
 const USER_AGENT = "148-arxiv-qfin/1.0 (Next.js reader; contact via repo)";
 
-/** arXiv asks clients to keep request rates modest. */
-const BATCH_SIZE = 3;
-const BATCH_DELAY_MS = 350;
+/** arXiv asks for one connection at a time and ~one request every 3 seconds. */
+const REQUEST_GAP_MS = 3_000;
+const RETRY_BACKOFF_MS = 1_500;
+const RATE_LIMIT_BACKOFF_MS = 6_000;
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout>;
+  return Promise.race([
+    promise,
+    new Promise<never>((_, reject) => {
+      timer = setTimeout(
+        () => reject(new Error(`arXiv timed out after ${Math.round(ms / 1000)}s`)),
+        ms,
+      );
+    }),
+  ]).finally(() => clearTimeout(timer)) as Promise<T>;
+}
 
 /**
  * arXiv throttles cloud IPs and can leave a request hanging. Without these
@@ -26,9 +46,7 @@ const BATCH_DELAY_MS = 350;
  * are enforced. Running out of budget degrades to a thinner page that the next
  * revalidation fills in — never a failed build.
  */
-const REQUEST_TIMEOUT_MS = 12_000;
 const REQUEST_ATTEMPTS = 2;
-const SNAPSHOT_BUDGET_MS = 40_000;
 
 export interface Paper {
   id: string;
@@ -46,7 +64,6 @@ export interface Paper {
   comment?: string;
   journalRef?: string;
   doi?: string;
-  summary: PaperSummary;
 }
 
 export interface CategoryFeed {
@@ -57,9 +74,13 @@ export interface CategoryFeed {
 
 export interface ArchiveSnapshot {
   fetchedAt: string;
+  range: RangeKey;
   feeds: CategoryFeed[];
   latest: Paper[];
   totalPapers: number;
+  /** Submissions in the window upstream, so the UI can show what was left out. */
+  windowTotal: number;
+  warning?: string;
 }
 
 function decodeEntities(input: string): string {
@@ -136,7 +157,6 @@ function parseEntry(entryXml: string): Paper | null {
     comment: tidy(firstTag(entryXml, "arxiv:comment")) || undefined,
     journalRef: tidy(firstTag(entryXml, "arxiv:journal_ref")) || undefined,
     doi: tidy(firstTag(entryXml, "arxiv:doi")) || undefined,
-    summary: summarizeAbstract(abstract, title),
   };
 }
 
@@ -147,32 +167,88 @@ export function parseAtomFeed(xml: string): Paper[] {
     .filter((p): p is Paper => p !== null);
 }
 
+interface QueryResult {
+  papers: Paper[];
+  /** Matches in the whole window, which can exceed what was requested. */
+  total: number;
+}
+
+/** arXiv wants `submittedDate:[YYYYMMDDHHMM TO YYYYMMDDHHMM]`. */
+function submittedDateFilter(days: number): string {
+  const stamp = (d: Date, endOfDay: boolean) =>
+    [
+      d.getUTCFullYear(),
+      String(d.getUTCMonth() + 1).padStart(2, "0"),
+      String(d.getUTCDate()).padStart(2, "0"),
+      endOfDay ? "2359" : "0000",
+    ].join("");
+
+  const now = new Date();
+  const from = new Date(now.getTime() - days * 24 * 60 * 60_000);
+  return `submittedDate:[${stamp(from, false)} TO ${stamp(now, true)}]`;
+}
+
 async function queryArxiv(
   searchQuery: string,
   maxResults: number,
   revalidate: number,
-): Promise<Paper[]> {
+  timeoutMs: number,
+  deadline = Number.POSITIVE_INFINITY,
+  sortBy: "submittedDate" | "relevance" = "submittedDate",
+): Promise<QueryResult> {
+  // Deep `start` offsets are dramatically slower than one larger request, so
+  // results are always taken from a single page.
   const url =
     `${API_BASE}?search_query=${encodeURIComponent(searchQuery)}` +
-    `&sortBy=submittedDate&sortOrder=descending&start=0&max_results=${maxResults}`;
+    `&sortBy=${sortBy}&sortOrder=descending&start=0&max_results=${maxResults}`;
 
   let lastError: unknown;
+  let rateLimited = false;
 
   for (let attempt = 1; attempt <= REQUEST_ATTEMPTS; attempt++) {
-    try {
-      const res = await fetch(url, {
-        headers: { "User-Agent": USER_AGENT, Accept: "application/atom+xml" },
-        next: { revalidate },
-        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-      });
+    // Never let a retry run past the caller's budget; a serverless function
+    // that overruns is killed with no response at all.
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
 
+    const limit = Math.min(timeoutMs, remaining);
+
+    try {
+      // Raced rather than relying on the abort signal alone: under Next's
+      // cached fetch an aborted request has been observed to keep running,
+      // which is how a 45s budget once turned into a 101s response.
+      const res = await withTimeout(
+        fetch(url, {
+          headers: { "User-Agent": USER_AGENT, Accept: "application/atom+xml" },
+          next: { revalidate },
+          signal: AbortSignal.timeout(limit),
+        }),
+        limit,
+      );
+
+      if (res.status === 429) {
+        rateLimited = true;
+        throw new Error("arXiv rate limited this request (429)");
+      }
       if (!res.ok) throw new Error(`arXiv responded ${res.status}`);
-      return parseAtomFeed(await res.text());
+
+      const xml = await withTimeout(res.text(), limit);
+      const papers = parseAtomFeed(xml);
+      const total = Number(
+        xml.match(/<opensearch:totalResults[^>]*>(\d+)</)?.[1] ?? papers.length,
+      );
+      return { papers, total };
     } catch (error) {
       lastError =
         error instanceof Error && error.name === "TimeoutError"
-          ? new Error(`arXiv timed out after ${REQUEST_TIMEOUT_MS / 1000}s`)
+          ? new Error(`arXiv timed out after ${timeoutMs / 1000}s`)
           : error;
+
+      // Retrying a throttled request immediately just earns another 429.
+      if (attempt < REQUEST_ATTEMPTS) {
+        await sleep(rateLimited ? RATE_LIMIT_BACKOFF_MS : RETRY_BACKOFF_MS);
+        rateLimited = false;
+      }
     }
   }
 
@@ -189,99 +265,175 @@ const QUERY_ALIASES: Partial<Record<CategoryId, string>> = {
 
 export async function fetchCategory(
   categoryId: CategoryId,
-  maxResults = 15,
+  range: RangeConfig = RANGES[DEFAULT_RANGE],
   revalidate = REVALIDATE_SECONDS,
-): Promise<Paper[]> {
+): Promise<QueryResult> {
   const term = QUERY_ALIASES[categoryId] ?? categoryId;
-  const papers = await queryArxiv(`cat:${term}`, maxResults, revalidate);
+  const searchQuery =
+    range.days === null
+      ? `cat:${term}`
+      : `cat:${term} AND ${submittedDateFilter(range.days)}`;
 
-  if (term === categoryId) return papers;
-  return papers.map((paper) => ({
-    ...paper,
-    qfinCategories: paper.qfinCategories.length
-      ? paper.qfinCategories
-      : [categoryId],
-  }));
+  const result = await queryArxiv(
+    searchQuery,
+    range.perCategory,
+    revalidate,
+    range.requestTimeoutMs,
+  );
+
+  if (term === categoryId) return result;
+  return {
+    ...result,
+    papers: result.papers.map((paper) => ({
+      ...paper,
+      qfinCategories: paper.qfinCategories.length
+        ? paper.qfinCategories
+        : [categoryId],
+    })),
+  };
 }
 
-export async function fetchLatestAcrossQfin(
-  maxResults = 40,
+/** Everything q-fin, including the econ.GN papers that q-fin.EC aliases. */
+const QFIN_SCOPE = "(cat:q-fin* OR cat:econ.GN)";
+
+export interface SearchResult {
+  query: string;
+  range: RangeKey;
+  papers: Paper[];
+  /** Matches in the archive, which can exceed the number returned. */
+  total: number;
+}
+
+/**
+ * Search the whole q-fin archive rather than the loaded window. arXiv's `all:`
+ * field covers titles, abstracts, authors and comments, so this reaches papers
+ * the reader has never had on screen.
+ */
+export async function searchArchive(
+  rawQuery: string,
+  rangeKey: RangeKey = DEFAULT_RANGE,
+  limit = 100,
   revalidate = REVALIDATE_SECONDS,
-): Promise<Paper[]> {
-  return queryArxiv("cat:q-fin*", maxResults, revalidate);
+): Promise<SearchResult> {
+  const range = RANGES[rangeKey] ?? RANGES[DEFAULT_RANGE];
+
+  // Field prefixes, quotes and boolean operators would change the meaning of
+  // the query we build, so the user's text is reduced to plain terms.
+  const cleaned = rawQuery
+    .replace(/[^\p{L}\p{N}\s.\-']/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (!cleaned) {
+    return { query: rawQuery, range: range.key, papers: [], total: 0 };
+  }
+
+  const term = cleaned.includes(" ") ? `all:"${cleaned}"` : `all:${cleaned}`;
+  const parts = [term, QFIN_SCOPE];
+  if (range.days !== null) parts.push(submittedDateFilter(range.days));
+
+  const { papers, total } = await queryArxiv(
+    parts.join(" AND "),
+    limit,
+    revalidate,
+    range.requestTimeoutMs,
+    Date.now() + range.requestTimeoutMs,
+    "relevance",
+  );
+
+  return { query: rawQuery, range: range.key, papers, total };
 }
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+function withWindow(term: string, days: number | null): string {
+  return days === null
+    ? `cat:${term}`
+    : `cat:${term} AND ${submittedDateFilter(days)}`;
+}
 
-/** Pull every q-fin subject class plus a combined "latest" stream. */
+/**
+ * Pull a window of q-fin papers and bucket them into subject classes.
+ *
+ * arXiv asks for a single connection and roughly one request every three
+ * seconds, so this deliberately makes two sequential requests rather than one
+ * per subject class: a fan-out across all nine gets the caller throttled with
+ * 429s, which is exactly what happened before this was rewritten.
+ */
 export async function fetchArchiveSnapshot(
-  perCategory = 12,
+  rangeKey: RangeKey = DEFAULT_RANGE,
   revalidate = REVALIDATE_SECONDS,
 ): Promise<ArchiveSnapshot> {
-  const feeds: CategoryFeed[] = [];
-  const deadline = Date.now() + SNAPSHOT_BUDGET_MS;
+  const range = RANGES[rangeKey] ?? RANGES[DEFAULT_RANGE];
+  const deadline = Date.now() + range.budgetMs;
 
-  for (let i = 0; i < CATEGORIES.length; i += BATCH_SIZE) {
-    const batch = CATEGORIES.slice(i, i + BATCH_SIZE);
+  const collected: Paper[] = [];
+  const errors: string[] = [];
+  let windowTotal = 0;
+  const started = Date.now();
 
-    if (Date.now() >= deadline) {
-      feeds.push(
-        ...batch.map((category) => ({
-          categoryId: category.id,
-          papers: [],
-          error: "Skipped: arXiv was too slow to answer in time",
+  try {
+    const bulk = await queryArxiv(
+      withWindow("q-fin*", range.days),
+      range.bulk,
+      revalidate,
+      range.requestTimeoutMs,
+      deadline,
+    );
+    collected.push(...bulk.papers);
+    windowTotal += bulk.total;
+  } catch (error) {
+    errors.push(error instanceof Error ? error.message : "q-fin fetch failed");
+  }
+
+  // econ.GN is what q-fin.EC aliases; those papers carry no q-fin code at all,
+  // so `cat:q-fin*` never returns them and they need their own pass.
+  if (Date.now() < deadline) {
+    await sleep(REQUEST_GAP_MS);
+    try {
+      const econ = await queryArxiv(
+        withWindow("econ.GN", range.days),
+        range.econ,
+        revalidate,
+        range.requestTimeoutMs,
+        deadline,
+      );
+      collected.push(
+        ...econ.papers.map((paper) => ({
+          ...paper,
+          qfinCategories: paper.qfinCategories.length
+            ? paper.qfinCategories
+            : ["q-fin.EC"],
         })),
       );
-      continue;
-    }
-
-    const settled = await Promise.all(
-      batch.map(async (category): Promise<CategoryFeed> => {
-        try {
-          const papers = await fetchCategory(category.id, perCategory, revalidate);
-          return { categoryId: category.id, papers };
-        } catch (error) {
-          return {
-            categoryId: category.id,
-            papers: [],
-            error: error instanceof Error ? error.message : "Fetch failed",
-          };
-        }
-      }),
-    );
-    feeds.push(...settled);
-    if (i + BATCH_SIZE < CATEGORIES.length) await sleep(BATCH_DELAY_MS);
-  }
-
-  /** Merge the per-category feeds when the bulk query fails or is skipped. */
-  const mergedLatest = () => {
-    const seen = new Set<string>();
-    return feeds
-      .flatMap((f) => f.papers)
-      .filter((p) => (seen.has(p.arxivId) ? false : seen.add(p.arxivId)))
-      .sort((a, b) => b.published.localeCompare(a.published))
-      .slice(0, 40);
-  };
-
-  let latest: Paper[] = [];
-  if (Date.now() >= deadline) {
-    latest = mergedLatest();
-  } else {
-    try {
-      latest = await fetchLatestAcrossQfin(40, revalidate);
-    } catch {
-      latest = mergedLatest();
+      windowTotal += econ.total;
+    } catch (error) {
+      errors.push(error instanceof Error ? error.message : "econ fetch failed");
     }
   }
 
-  const unique = new Set<string>();
-  for (const feed of feeds) for (const p of feed.papers) unique.add(p.arxivId);
-  for (const p of latest) unique.add(p.arxivId);
+  const seen = new Set<string>();
+  const papers = collected
+    .filter((p) => (seen.has(p.arxivId) ? false : seen.add(p.arxivId)))
+    .sort((a, b) => b.published.localeCompare(a.published));
+
+  const feeds: CategoryFeed[] = CATEGORIES.map((category) => ({
+    categoryId: category.id,
+    papers: papers.filter((p) => p.qfinCategories.includes(category.id)),
+  }));
+
+  // arXiv latency swings from 100ms to a minute depending on how it is feeling
+  // about your IP, so keep a breadcrumb for diagnosing slow loads.
+  console.log(
+    `[arxiv] ${range.key}: ${papers.length} papers in ${Date.now() - started}ms` +
+      (errors.length ? ` (${errors.join("; ")})` : ""),
+  );
 
   return {
     fetchedAt: new Date().toISOString(),
+    range: range.key,
     feeds,
-    latest,
-    totalPapers: unique.size,
+    latest: papers,
+    totalPapers: papers.length,
+    windowTotal,
+    warning: papers.length === 0 && errors.length ? errors[0] : undefined,
   };
 }
