@@ -1,20 +1,14 @@
-import { ArrowUpRight, BookOpen, Layers, RefreshCcwDot, TrendingUp } from "lucide-react";
+import { ArrowUpRight, TrendingUp } from "lucide-react";
 
 import { ArchiveExplorer } from "@/components/archive-explorer";
-import { RelativeTime } from "@/components/relative-time";
 import { Badge } from "@/components/ui/badge";
-import { Card, CardContent } from "@/components/ui/card";
-import { fetchArchiveSnapshot, REVALIDATE_SECONDS } from "@/lib/arxiv";
-import { CATEGORIES } from "@/lib/categories";
 
-export const revalidate = 1800;
-
-export default async function Home() {
-  const snapshot = await fetchArchiveSnapshot();
-  const failed = snapshot.feeds.filter((f) => f.error).length;
-
-  const newestPublished = snapshot.latest[0]?.published ?? "";
-
+/**
+ * Deliberately free of data fetching: the shell is fully static so a deploy can
+ * never depend on arXiv being reachable or fast. Papers are loaded from
+ * /api/papers in the browser, which caches upstream responses for 30 minutes.
+ */
+export default function Home() {
   return (
     <main className="mx-auto w-full max-w-[1600px] px-4 py-8 sm:px-6 lg:px-8">
       <header className="mb-8">
@@ -41,34 +35,9 @@ export default async function Home() {
           Latest submissions from every Quantitative Finance subject class, with an
           auto-generated summary, key findings and topic tags for each paper.
         </p>
-
-        <div className="mt-5 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-          <StatCard
-            icon={<BookOpen className="size-4" />}
-            label="Papers loaded"
-            value={String(snapshot.totalPapers)}
-          />
-          <StatCard
-            icon={<Layers className="size-4" />}
-            label="Subject classes"
-            value={`${CATEGORIES.length - failed} / ${CATEGORIES.length}`}
-          />
-          <StatCard
-            icon={<TrendingUp className="size-4" />}
-            label="Newest submission"
-            value={
-              newestPublished ? <RelativeTime iso={newestPublished} /> : "—"
-            }
-          />
-          <StatCard
-            icon={<RefreshCcwDot className="size-4" />}
-            label="Cache window"
-            value={`${Math.round(REVALIDATE_SECONDS / 60)} min`}
-          />
-        </div>
       </header>
 
-      <ArchiveExplorer snapshot={snapshot} />
+      <ArchiveExplorer />
 
       <footer className="mt-12 border-t border-border pt-6 text-xs text-muted-foreground">
         <p>
@@ -76,32 +45,7 @@ export default async function Home() {
           ranking of each abstract — always read the source paper before citing.
           Thank you to arXiv for use of its open access interoperability.
         </p>
-        <p className="mt-1">
-          Fetched <RelativeTime iso={snapshot.fetchedAt} />.
-        </p>
       </footer>
     </main>
-  );
-}
-
-function StatCard({
-  icon,
-  label,
-  value,
-}: {
-  icon: React.ReactNode;
-  label: string;
-  value: React.ReactNode;
-}) {
-  return (
-    <Card>
-      <CardContent className="flex items-center gap-3 p-4">
-        <div className="rounded-lg bg-primary/10 p-2 text-primary">{icon}</div>
-        <div className="min-w-0">
-          <p className="truncate text-xs text-muted-foreground">{label}</p>
-          <p className="text-lg font-semibold tracking-tight">{value}</p>
-        </div>
-      </CardContent>
-    </Card>
   );
 }

@@ -65,20 +65,27 @@ Two details worth knowing:
   several subject classes.
 
 Requests go out in batches of three to stay polite with arXiv, and responses are cached
-for 30 minutes through Next.js ISR. The **Refresh** button bypasses that cache.
+for 30 minutes on the server. The **Refresh** button bypasses that cache.
 
 Every request is bounded by a 12-second timeout with one retry, and the whole snapshot
 has a 40-second budget. arXiv throttles cloud IPs and will sometimes accept a connection
-and then never answer; without those bounds a single stalled request hangs the prerender
-until the host's build timeout kills the deploy. Once the budget is spent, remaining
-subject classes are skipped and the page renders with what arrived — the next
-revalidation fills in the rest, so a slow upstream degrades the page instead of failing
-the build.
+and then never answer, so without those bounds a single stalled request hangs forever.
+Once the budget is spent, remaining subject classes are skipped and the page renders
+with what arrived, marked "Skipped: arXiv was too slow to answer in time".
 
 ## Deploying
 
-The app builds on Vercel with no configuration or environment variables. The home page
-is prerendered at build time and then revalidated every 30 minutes.
+The app builds on Vercel with no configuration or environment variables.
+
+**No page fetches arXiv at build time.** The home page is a fully static shell and papers
+are loaded from `/api/papers` in the browser, so a build cannot fail because arXiv is
+slow, throttling, or down. This was not the original design: prerendering the page meant
+every deploy depended on arXiv answering within Vercel's 60-second static generation
+limit, and it did not.
+
+The trade-off is that paper content is not server-rendered, so it is not visible to
+crawlers that do not execute JavaScript. For a reading dashboard that is a fair price
+for deploys that cannot break on someone else's rate limiter.
 
 ### Summaries
 
@@ -104,31 +111,34 @@ The same data is available as JSON:
 | `GET /api/papers` | Full snapshot: every subject class plus the latest stream |
 | `GET /api/papers?category=q-fin.TR` | One subject class |
 | `GET /api/papers?limit=20` | Papers per class (default 12) |
-| `GET /api/papers?refresh=1` | Bypass the ISR cache |
+| `GET /api/papers?refresh=1` | Bypass the 30-minute cache |
 
-Responses reuse the same 30-minute fetch cache as the page, so repeat calls return in
-milliseconds instead of re-querying arXiv.
+This route is what the UI itself calls. Responses are cached for 30 minutes, so repeat
+calls return in milliseconds instead of re-querying arXiv.
 
 ## Layout
 
 ```
 app/
-  page.tsx            server component; fetches the snapshot, renders header stats
-  loading.tsx         skeleton shown while the snapshot loads
-  api/papers/route.ts JSON API
+  page.tsx            static shell; no data fetching
+  api/papers/route.ts JSON API, the only place that talks to arXiv
 components/
-  archive-explorer.tsx  tabs, search and sort (client)
+  archive-explorer.tsx  fetches papers, stats, tabs, search and sort (client)
   paper-card.tsx        summary card with expandable abstract
   relative-time.tsx     client-rendered "2d ago" labels
   ui/                   shadcn/ui components
 lib/
-  arxiv.ts            API client and Atom parser
+  arxiv.ts            API client and Atom parser (server only)
   summarize.ts        extractive summarizer
   categories.ts       the nine q-fin subject classes
+  config.ts           constants shared by server and client
 ```
 
-Relative timestamps render as absolute dates on the server and swap to "2d ago" after
-mount, so a page prerendered 20 minutes ago does not hydrate with a stale "now".
+`lib/arxiv.ts` is imported as a value only by the API route; components import from it
+with `import type`, so none of the arXiv client reaches the browser bundle.
+
+Relative timestamps render as absolute dates first and swap to "2d ago" after mount, so
+a cached page does not hydrate with a stale "now".
 
 ## Credit
 

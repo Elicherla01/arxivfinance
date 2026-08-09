@@ -7,7 +7,10 @@
  */
 
 import { CATEGORIES, type CategoryId } from "./categories";
+import { REVALIDATE_SECONDS } from "./config";
 import { summarizeAbstract, type PaperSummary } from "./summarize";
+
+export { REVALIDATE_SECONDS };
 
 const API_BASE = "https://export.arxiv.org/api/query";
 const USER_AGENT = "148-arxiv-qfin/1.0 (Next.js reader; contact via repo)";
@@ -15,7 +18,6 @@ const USER_AGENT = "148-arxiv-qfin/1.0 (Next.js reader; contact via repo)";
 /** arXiv asks clients to keep request rates modest. */
 const BATCH_SIZE = 3;
 const BATCH_DELAY_MS = 350;
-export const REVALIDATE_SECONDS = 1800;
 
 /**
  * arXiv throttles cloud IPs and can leave a request hanging. Without these

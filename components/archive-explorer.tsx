@@ -1,18 +1,34 @@
 "use client";
 
 import * as React from "react";
-import { LayoutGrid, RefreshCw, Search, SlidersHorizontal, X } from "lucide-react";
+import {
+  BookOpen,
+  Layers,
+  LayoutGrid,
+  RefreshCcwDot,
+  RefreshCw,
+  Search,
+  SlidersHorizontal,
+  TrendingUp,
+  TriangleAlert,
+  X,
+} from "lucide-react";
 
 import { PaperCard } from "@/components/paper-card";
+import { RelativeTime } from "@/components/relative-time";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
+import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { CATEGORIES } from "@/lib/categories";
 import type { ArchiveSnapshot, Paper } from "@/lib/arxiv";
+import { CATEGORIES } from "@/lib/categories";
+import { REVALIDATE_SECONDS } from "@/lib/config";
 import { cn } from "@/lib/utils";
 
 type SortKey = "newest" | "oldest" | "authors";
+type Status = "loading" | "ready" | "error";
 
 const SORTS: Array<{ key: SortKey; label: string }> = [
   { key: "newest", label: "Newest" },
@@ -43,37 +59,138 @@ function matches(paper: Paper, query: string): boolean {
   );
 }
 
-export function ArchiveExplorer({ snapshot }: { snapshot: ArchiveSnapshot }) {
+async function fetchSnapshot(
+  refresh: boolean,
+  signal?: AbortSignal,
+): Promise<ArchiveSnapshot> {
+  const res = await fetch(`/api/papers${refresh ? "?refresh=1" : ""}`, {
+    cache: "no-store",
+    signal,
+  });
+  if (!res.ok) throw new Error(`Request failed with ${res.status}`);
+
+  const data = (await res.json()) as ArchiveSnapshot & { error?: string };
+  if (data.error) throw new Error(data.error);
+  return data;
+}
+
+function describeError(error: unknown): string {
+  return error instanceof Error
+    ? error.message
+    : "Could not reach the arXiv API";
+}
+
+export function ArchiveExplorer() {
+  const [snapshot, setSnapshot] = React.useState<ArchiveSnapshot | null>(null);
+  const [status, setStatus] = React.useState<Status>("loading");
+  const [errorMessage, setErrorMessage] = React.useState("");
+  const [refreshing, setRefreshing] = React.useState(false);
+
   const [query, setQuery] = React.useState("");
   const [sort, setSort] = React.useState<SortKey>("newest");
   const [tab, setTab] = React.useState("latest");
-  const [refreshing, setRefreshing] = React.useState(false);
+
+  // State is only touched after the await, so the initial load does not cascade
+  // renders. Aborting on unmount keeps a slow arXiv from setting state late.
+  React.useEffect(() => {
+    const controller = new AbortController();
+
+    void (async () => {
+      try {
+        const data = await fetchSnapshot(false, controller.signal);
+        setSnapshot(data);
+        setStatus("ready");
+      } catch (error) {
+        if (controller.signal.aborted) return;
+        setErrorMessage(describeError(error));
+        setStatus("error");
+      }
+    })();
+
+    return () => controller.abort();
+  }, []);
+
+  /** Retry and Refresh run from event handlers, where setState is fine. */
+  const reload = async (forceRefresh: boolean) => {
+    if (forceRefresh) setRefreshing(true);
+    else setStatus("loading");
+
+    try {
+      const data = await fetchSnapshot(forceRefresh);
+      setSnapshot(data);
+      setStatus("ready");
+    } catch (error) {
+      setErrorMessage(describeError(error));
+      setStatus("error");
+    } finally {
+      setRefreshing(false);
+    }
+  };
 
   const feedMap = React.useMemo(() => {
     const map = new Map<string, Paper[]>();
-    for (const feed of snapshot.feeds) map.set(feed.categoryId, feed.papers);
+    for (const feed of snapshot?.feeds ?? []) map.set(feed.categoryId, feed.papers);
     return map;
-  }, [snapshot.feeds]);
+  }, [snapshot]);
 
   const visible = React.useCallback(
     (papers: Paper[]) => sortPapers(papers.filter((p) => matches(p, query)), sort),
     [query, sort],
   );
 
-  const refresh = async () => {
-    setRefreshing(true);
-    try {
-      await fetch("/api/papers?refresh=1", { cache: "no-store" });
-      window.location.reload();
-    } catch {
-      setRefreshing(false);
-    }
-  };
+  if (status === "loading") return <ExplorerSkeleton />;
+
+  if (status === "error" || !snapshot) {
+    return (
+      <div className="rounded-xl border border-destructive/30 bg-destructive/5 p-8 text-center">
+        <TriangleAlert className="mx-auto size-6 text-destructive" />
+        <p className="mt-3 font-medium text-foreground">Could not load papers</p>
+        <p className="mx-auto mt-1 max-w-md text-sm text-muted-foreground">
+          {errorMessage}. arXiv occasionally throttles requests — trying again
+          usually works.
+        </p>
+        <Button className="mt-4" onClick={() => void reload(false)}>
+          <RefreshCw />
+          Try again
+        </Button>
+      </div>
+    );
+  }
 
   const latestVisible = visible(snapshot.latest);
+  const failed = snapshot.feeds.filter((f) => f.error).length;
 
   return (
     <div className="space-y-5">
+      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+        <StatCard
+          icon={<BookOpen className="size-4" />}
+          label="Papers loaded"
+          value={String(snapshot.totalPapers)}
+        />
+        <StatCard
+          icon={<Layers className="size-4" />}
+          label="Subject classes"
+          value={`${CATEGORIES.length - failed} / ${CATEGORIES.length}`}
+        />
+        <StatCard
+          icon={<TrendingUp className="size-4" />}
+          label="Newest submission"
+          value={
+            snapshot.latest[0] ? (
+              <RelativeTime iso={snapshot.latest[0].published} />
+            ) : (
+              "—"
+            )
+          }
+        />
+        <StatCard
+          icon={<RefreshCcwDot className="size-4" />}
+          label="Updated"
+          value={<RelativeTime iso={snapshot.fetchedAt} />}
+        />
+      </div>
+
       <div className="flex flex-wrap items-center gap-2">
         <div className="relative min-w-[240px] flex-1">
           <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
@@ -113,7 +230,12 @@ export function ArchiveExplorer({ snapshot }: { snapshot: ArchiveSnapshot }) {
           ))}
         </div>
 
-        <Button variant="outline" size="sm" onClick={refresh} disabled={refreshing}>
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={() => void reload(true)}
+          disabled={refreshing}
+        >
           <RefreshCw className={cn(refreshing && "animate-spin")} />
           {refreshing ? "Refreshing" : "Refresh"}
         </Button>
@@ -129,24 +251,18 @@ export function ArchiveExplorer({ snapshot }: { snapshot: ArchiveSnapshot }) {
                 {latestVisible.length}
               </Badge>
             </TabsTrigger>
-            {CATEGORIES.map((category) => {
-              const count = visible(feedMap.get(category.id) ?? []).length;
-              return (
-                <TabsTrigger key={category.id} value={category.id}>
-                  <span
-                    className="size-2 rounded-full"
-                    style={{ background: category.accent }}
-                  />
-                  {category.name}
-                  <Badge
-                    variant="secondary"
-                    className="ml-1 px-1.5 py-0 text-[10px]"
-                  >
-                    {count}
-                  </Badge>
-                </TabsTrigger>
-              );
-            })}
+            {CATEGORIES.map((category) => (
+              <TabsTrigger key={category.id} value={category.id}>
+                <span
+                  className="size-2 rounded-full"
+                  style={{ background: category.accent }}
+                />
+                {category.name}
+                <Badge variant="secondary" className="ml-1 px-1.5 py-0 text-[10px]">
+                  {visible(feedMap.get(category.id) ?? []).length}
+                </Badge>
+              </TabsTrigger>
+            ))}
           </TabsList>
         </div>
 
@@ -159,7 +275,6 @@ export function ArchiveExplorer({ snapshot }: { snapshot: ArchiveSnapshot }) {
 
         {CATEGORIES.map((category) => {
           const feed = snapshot.feeds.find((f) => f.categoryId === category.id);
-          const papers = visible(feed?.papers ?? []);
           return (
             <TabsContent key={category.id} value={category.id}>
               <div className="mb-4 flex flex-wrap items-baseline gap-x-2 gap-y-1">
@@ -178,11 +293,16 @@ export function ArchiveExplorer({ snapshot }: { snapshot: ArchiveSnapshot }) {
                   Could not load this class: {feed.error}
                 </p>
               )}
-              <PaperGrid papers={papers} query={query} />
+              <PaperGrid papers={visible(feed?.papers ?? [])} query={query} />
             </TabsContent>
           );
         })}
       </Tabs>
+
+      <p className="pt-1 text-xs text-muted-foreground">
+        Upstream responses are cached for {Math.round(REVALIDATE_SECONDS / 60)}{" "}
+        minutes. Use Refresh to bypass the cache.
+      </p>
     </div>
   );
 }
@@ -205,6 +325,47 @@ function PaperGrid({ papers, query }: { papers: Paper[]; query: string }) {
       {papers.map((paper, i) => (
         <PaperCard key={paper.id} paper={paper} index={i} />
       ))}
+    </div>
+  );
+}
+
+function StatCard({
+  icon,
+  label,
+  value,
+}: {
+  icon: React.ReactNode;
+  label: string;
+  value: React.ReactNode;
+}) {
+  return (
+    <Card>
+      <CardContent className="flex items-center gap-3 p-4">
+        <div className="rounded-lg bg-primary/10 p-2 text-primary">{icon}</div>
+        <div className="min-w-0">
+          <p className="truncate text-xs text-muted-foreground">{label}</p>
+          <p className="text-lg font-semibold tracking-tight">{value}</p>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+function ExplorerSkeleton() {
+  return (
+    <div className="space-y-5">
+      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+        {Array.from({ length: 4 }).map((_, i) => (
+          <Skeleton key={i} className="h-[74px] rounded-xl" />
+        ))}
+      </div>
+      <Skeleton className="h-9 w-full rounded-md" />
+      <Skeleton className="h-11 w-full max-w-3xl rounded-lg" />
+      <div className="grid gap-4 lg:grid-cols-2 2xl:grid-cols-3">
+        {Array.from({ length: 6 }).map((_, i) => (
+          <Skeleton key={i} className="h-72 rounded-xl" />
+        ))}
+      </div>
     </div>
   );
 }
