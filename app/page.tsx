@@ -1,6 +1,7 @@
 import { ArrowUpRight, TrendingUp } from "lucide-react";
 
 import { ArchiveExplorer } from "@/components/archive-explorer";
+import { SiteFooter } from "@/components/site-footer";
 import { Badge } from "@/components/ui/badge";
 
 /**
@@ -39,13 +40,7 @@ export default function Home() {
 
       <ArchiveExplorer />
 
-      <footer className="mt-12 border-t border-border pt-6 text-xs text-muted-foreground">
-        <p>
-          Data from the arXiv API. Summaries are generated locally by extractive
-          ranking of each abstract — always read the source paper before citing.
-          Thank you to arXiv for use of its open access interoperability.
-        </p>
-      </footer>
+      <SiteFooter />
     </main>
   );
 }
