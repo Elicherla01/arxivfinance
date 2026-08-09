@@ -67,6 +67,19 @@ Two details worth knowing:
 Requests go out in batches of three to stay polite with arXiv, and responses are cached
 for 30 minutes through Next.js ISR. The **Refresh** button bypasses that cache.
 
+Every request is bounded by a 12-second timeout with one retry, and the whole snapshot
+has a 40-second budget. arXiv throttles cloud IPs and will sometimes accept a connection
+and then never answer; without those bounds a single stalled request hangs the prerender
+until the host's build timeout kills the deploy. Once the budget is spent, remaining
+subject classes are skipped and the page renders with what arrived — the next
+revalidation fills in the rest, so a slow upstream degrades the page instead of failing
+the build.
+
+## Deploying
+
+The app builds on Vercel with no configuration or environment variables. The home page
+is prerendered at build time and then revalidated every 30 minutes.
+
 ### Summaries
 
 `lib/summarize.ts` builds each summary locally by extractive ranking — no model or API

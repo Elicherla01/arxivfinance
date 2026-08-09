@@ -17,6 +17,17 @@ const BATCH_SIZE = 3;
 const BATCH_DELAY_MS = 350;
 export const REVALIDATE_SECONDS = 1800;
 
+/**
+ * arXiv throttles cloud IPs and can leave a request hanging. Without these
+ * bounds a single stalled response blocks the prerender until the host's build
+ * timeout kills it, so both a per-request timeout and a whole-snapshot budget
+ * are enforced. Running out of budget degrades to a thinner page that the next
+ * revalidation fills in — never a failed build.
+ */
+const REQUEST_TIMEOUT_MS = 12_000;
+const REQUEST_ATTEMPTS = 2;
+const SNAPSHOT_BUDGET_MS = 40_000;
+
 export interface Paper {
   id: string;
   arxivId: string;
@@ -143,15 +154,27 @@ async function queryArxiv(
     `${API_BASE}?search_query=${encodeURIComponent(searchQuery)}` +
     `&sortBy=submittedDate&sortOrder=descending&start=0&max_results=${maxResults}`;
 
-  const res = await fetch(url, {
-    headers: { "User-Agent": USER_AGENT, Accept: "application/atom+xml" },
-    next: { revalidate },
-  });
+  let lastError: unknown;
 
-  if (!res.ok) {
-    throw new Error(`arXiv responded ${res.status}`);
+  for (let attempt = 1; attempt <= REQUEST_ATTEMPTS; attempt++) {
+    try {
+      const res = await fetch(url, {
+        headers: { "User-Agent": USER_AGENT, Accept: "application/atom+xml" },
+        next: { revalidate },
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      });
+
+      if (!res.ok) throw new Error(`arXiv responded ${res.status}`);
+      return parseAtomFeed(await res.text());
+    } catch (error) {
+      lastError =
+        error instanceof Error && error.name === "TimeoutError"
+          ? new Error(`arXiv timed out after ${REQUEST_TIMEOUT_MS / 1000}s`)
+          : error;
+    }
   }
-  return parseAtomFeed(await res.text());
+
+  throw lastError instanceof Error ? lastError : new Error("arXiv fetch failed");
 }
 
 /**
@@ -194,9 +217,22 @@ export async function fetchArchiveSnapshot(
   revalidate = REVALIDATE_SECONDS,
 ): Promise<ArchiveSnapshot> {
   const feeds: CategoryFeed[] = [];
+  const deadline = Date.now() + SNAPSHOT_BUDGET_MS;
 
   for (let i = 0; i < CATEGORIES.length; i += BATCH_SIZE) {
     const batch = CATEGORIES.slice(i, i + BATCH_SIZE);
+
+    if (Date.now() >= deadline) {
+      feeds.push(
+        ...batch.map((category) => ({
+          categoryId: category.id,
+          papers: [],
+          error: "Skipped: arXiv was too slow to answer in time",
+        })),
+      );
+      continue;
+    }
+
     const settled = await Promise.all(
       batch.map(async (category): Promise<CategoryFeed> => {
         try {
@@ -215,17 +251,25 @@ export async function fetchArchiveSnapshot(
     if (i + BATCH_SIZE < CATEGORIES.length) await sleep(BATCH_DELAY_MS);
   }
 
-  let latest: Paper[] = [];
-  try {
-    latest = await fetchLatestAcrossQfin(40, revalidate);
-  } catch {
-    // Fall back to merging the per-category feeds when the bulk query fails.
+  /** Merge the per-category feeds when the bulk query fails or is skipped. */
+  const mergedLatest = () => {
     const seen = new Set<string>();
-    latest = feeds
+    return feeds
       .flatMap((f) => f.papers)
       .filter((p) => (seen.has(p.arxivId) ? false : seen.add(p.arxivId)))
       .sort((a, b) => b.published.localeCompare(a.published))
       .slice(0, 40);
+  };
+
+  let latest: Paper[] = [];
+  if (Date.now() >= deadline) {
+    latest = mergedLatest();
+  } else {
+    try {
+      latest = await fetchLatestAcrossQfin(40, revalidate);
+    } catch {
+      latest = mergedLatest();
+    }
   }
 
   const unique = new Set<string>();
